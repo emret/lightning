@@ -817,7 +817,7 @@ static struct io_plan *handle_client(struct io_conn *conn,
 	struct client *c = container_of(dc, struct client, dc);
 	enum hsm_client_wire_type t = fromwire_peektype(dc->msg_in);
 
-	status_debug("Client: Received message %d from client", t);
+	//status_debug("Client: Received message %d from client", t);
 
 	/* Before we do anything else, is this client allowed to do
 	 * what he asks for? */
