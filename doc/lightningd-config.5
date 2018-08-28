@@ -2,12 +2,12 @@
 .\"     Title: lightningd-config
 .\"    Author: [see the "AUTHOR" section]
 .\" Generator: DocBook XSL Stylesheets v1.79.1 <http://docbook.sf.net/>
-.\"      Date: 07/12/2018
+.\"      Date: 08/15/2018
 .\"    Manual: \ \&
 .\"    Source: \ \&
 .\"  Language: English
 .\"
-.TH "LIGHTNINGD\-CONFIG" "5" "07/12/2018" "\ \&" "\ \&"
+.TH "LIGHTNINGD\-CONFIG" "5" "08/15/2018" "\ \&" "\ \&"
 .\" -----------------------------------------------------------------
 .\" * Define some portability stuff
 .\" -----------------------------------------------------------------
@@ -122,11 +122,6 @@ The bitcoind(1) RPC host to connect to\&.
 The bitcoind(1) RPC port to connect to\&.
 .RE
 .PP
-\fBdefault\-fee\-rate\fR=\fISATOSHIKSIPA\fR
-.RS 4
-Satoshis per 1000 transaction weight if bitcoind can\(cqt estimate fees\&.
-.RE
-.PP
 \fBrescan\fR=\fIBLOCKS\fR
 .RS 4
 Number of blocks to rescan from the current head, or absolute blockheight if negative\&. This is only needed if something goes badly wrong\&.
@@ -156,7 +151,7 @@ Prefix for log lines: this can be customized if you want to merge logs with mult
 .PP
 \fBlog\-file\fR=\fIPATH\fR
 .RS 4
-Log to this file instead of stdout\&.
+Log to this file instead of stdout\&. Sending lightningd(1) SIGHUP will cause it to reopen this file (useful for log rotation)\&.
 .RE
 .PP
 \fBrpc\-file\fR=\fIPATH\fR

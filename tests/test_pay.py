@@ -85,7 +85,8 @@ def test_pay0(node_factory):
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
 def test_pay_disconnect(node_factory, bitcoind):
     """If the remote node has disconnected, we fail payment, but can try again when it reconnects"""
-    l1, l2 = node_factory.line_graph(2, opts={'dev-max-fee-multiplier': 5})
+    l1, l2 = node_factory.line_graph(2, opts={'dev-max-fee-multiplier': 5,
+                                              'may_reconnect': True})
 
     inv = l2.rpc.invoice(123000, 'test_pay_disconnect', 'description')
     rhash = inv['payment_hash']
@@ -93,21 +94,28 @@ def test_pay_disconnect(node_factory, bitcoind):
     # Can't use `pay` since that'd notice that we can't route, due to disabling channel_update
     route = l1.rpc.getroute(l2.info['id'], 123000, 1)["route"]
 
-    # Make l2 upset by asking for crazy fee.
-    l1.rpc.dev_setfees('150000')
-    # Wait for l1 notice
-    l1.daemon.wait_for_log(r'Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: received ERROR channel .*: update_fee 150000 outside range 1875-75000')
+    l2.stop()
+    l1.daemon.wait_for_log('Disabling channel .*, active 1 -> 0')
 
     # Can't pay while its offline.
     with pytest.raises(RpcError):
         l1.rpc.sendpay(route, rhash)
     l1.daemon.wait_for_log('failed: WIRE_TEMPORARY_CHANNEL_FAILURE \\(First peer not ready\\)')
 
-    # Should fail due to temporary channel fail
+    l2.start()
+    l1.daemon.wait_for_log('peer_out WIRE_CHANNEL_REESTABLISH')
+
+    # Make l2 upset by asking for crazy fee.
+    l1.set_feerates((10**6, 1000**6, 1000**6), False)
+
+    # Wait for l1 notice
+    l1.daemon.wait_for_log(r'Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: received ERROR channel .*: update_fee \d+ outside range 1875-75000')
+
+    # Should fail due to permenant channel fail
     with pytest.raises(RpcError):
         l1.rpc.sendpay(route, rhash)
 
-    l1.daemon.wait_for_log('failed: WIRE_TEMPORARY_CHANNEL_FAILURE \\(First peer not ready\\)')
+    l1.daemon.wait_for_log('failed: WIRE_UNKNOWN_NEXT_PEER \\(First peer not ready\\)')
     assert not l1.daemon.is_in_log('Payment is still in progress')
 
     # After it sees block, someone should close channel.
@@ -182,9 +190,11 @@ def test_pay_optional_args(node_factory):
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
 def test_payment_success_persistence(node_factory, executor):
     # Start two nodes and open a channel.. die during payment.
+    # Feerates identical so we don't get gratuitous commit to update them
     l1 = node_factory.get_node(disconnect=['+WIRE_COMMITMENT_SIGNED'],
                                options={'dev-no-reconnect': None},
-                               may_reconnect=True)
+                               may_reconnect=True,
+                               feerates=(7500, 7500, 7500))
     l2 = node_factory.get_node(may_reconnect=True)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -226,9 +236,11 @@ def test_payment_success_persistence(node_factory, executor):
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
 def test_payment_failed_persistence(node_factory, executor):
     # Start two nodes and open a channel.. die during payment.
+    # Feerates identical so we don't get gratuitous commit to update them
     l1 = node_factory.get_node(disconnect=['+WIRE_COMMITMENT_SIGNED'],
                                options={'dev-no-reconnect': None},
-                               may_reconnect=True)
+                               may_reconnect=True,
+                               feerates=(7500, 7500, 7500))
     l2 = node_factory.get_node(may_reconnect=True)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -443,7 +455,7 @@ def test_sendpay_cant_afford(node_factory):
         pay(l1, l2, 10**9 + 1)
 
     # This is the fee, which needs to be taken into account for l1.
-    available = 10**9 - 6720
+    available = 10**9 - 13440
     # Reserve is 1%.
     reserve = 10**7
 

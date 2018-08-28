@@ -408,6 +408,9 @@ static void rcvd_htlc_reply(struct subd *subd, const u8 *msg, const int *fds UNU
 
 static void htlc_offer_timeout(struct channel *channel)
 {
+	/* Unset this in case we reconnect and start again. */
+	channel->htlc_timeout = NULL;
+
 	/* If owner died, we should already be taken care of. */
 	if (!channel->owner || channel->state != CHANNELD_NORMAL)
 		return;
@@ -1283,10 +1286,12 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	enum onion_type *failcodes;
 	size_t i;
 	struct lightningd *ld = channel->peer->ld;
+	u32 feerate;
 
 	if (!fromwire_channel_got_revoke(msg, msg,
 					 &revokenum, &per_commitment_secret,
 					 &next_per_commitment_point,
+					 &feerate,
 					 &changed)) {
 		channel_internal_error(channel, "bad fromwire_channel_got_revoke %s",
 				    tal_hex(channel, msg));
@@ -1344,6 +1349,10 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 				    revokenum);
 		return;
 	}
+
+	/* Update feerate: if we are funder, their revoke_and_ack has set
+	 * this for local feerate. */
+	channel->channel_info.feerate_per_kw[LOCAL] = feerate;
 
 	/* FIXME: Check per_commitment_secret -> per_commit_point */
 	update_per_commit_point(channel, &next_per_commitment_point);
@@ -1660,33 +1669,6 @@ void htlcs_notify_new_block(struct lightningd *ld, u32 height)
 		}
 	/* Iteration while removing is safe, but can skip entries! */
 	} while (removed);
-}
-
-void notify_feerate_change(struct lightningd *ld)
-{
-	struct peer *peer;
-
-	/* FIXME: We should notify onchaind about NORMAL fee change in case
-	 * it's going to generate more txs. */
-	list_for_each(&ld->peers, peer, list) {
-		struct channel *channel = peer_active_channel(peer);
-		u8 *msg;
-
-		if (!channel || !channel_fees_can_change(channel))
-			continue;
-
-		/* FIXME: We choose not to drop to chain if we can't contact
-		 * peer.  We *could* do so, however. */
-		if (!channel->owner)
-			continue;
-
-		msg = towire_channel_feerates(channel,
-					      get_feerate(ld->topology,
-							  FEERATE_IMMEDIATE),
-					      feerate_min(ld),
-					      feerate_max(ld));
-		subd_send_msg(channel->owner, take(msg));
-	}
 }
 
 #if DEVELOPER

@@ -3,11 +3,13 @@
 #include <bitcoin/pubkey.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
+#include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <ccan/container_of/container_of.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/endian/endian.h>
 #include <ccan/fdpass/fdpass.h>
+#include <ccan/intmap/intmap.h>
 #include <ccan/io/fdpass/fdpass.h>
 #include <ccan/io/io.h>
 #include <ccan/noerr/noerr.h>
@@ -56,13 +58,20 @@ struct client {
 
 	struct pubkey id;
 	u64 dbid;
-	struct io_plan *(*handle)(struct io_conn *, struct daemon_conn *);
 
 	/* What is this client allowed to ask for? */
 	u64 capabilities;
 };
 
+/* We keep a map of nonzero dbid -> clients */
+static UINTMAP(struct client *) clients;
+/* We get three zero-dbid clients: master, gossipd and connnectd. */
+static struct client *dbid_zero_clients[3];
+static size_t num_dbid_zero_clients;
+
 /* Function declarations for later */
+static struct io_plan *handle_client(struct io_conn *conn,
+				     struct daemon_conn *dc);
 static void init_hsm(struct daemon_conn *master, const u8 *msg);
 static void pass_client_hsmfd(struct daemon_conn *master, const u8 *msg);
 static void sign_funding_tx(struct daemon_conn *master, const u8 *msg);
@@ -92,12 +101,17 @@ static void node_key(struct privkey *node_privkey, struct pubkey *node_id)
 					     node_privkey->secret.data));
 }
 
+static void destroy_client(struct client *c)
+{
+	if (!uintmap_del(&clients, c->dbid))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Failed to remove client dbid %"PRIu64, c->dbid);
+}
+
 static struct client *new_client(struct daemon_conn *master,
 				 const struct pubkey *id,
 				 u64 dbid,
 				 const u64 capabilities,
-				 struct io_plan *(*handle)(struct io_conn *,
-							   struct daemon_conn *),
 				 int fd)
 {
 	struct client *c = tal(master, struct client);
@@ -109,15 +123,31 @@ static struct client *new_client(struct daemon_conn *master,
 	}
 	c->dbid = dbid;
 
-	c->handle = handle;
 	c->master = master;
 	c->capabilities = capabilities;
-	daemon_conn_init(c, &c->dc, fd, handle, NULL);
+	daemon_conn_init(c, &c->dc, fd, handle_client, NULL);
 
 	/* Free the connection if we exit everything. */
 	tal_steal(master, c->dc.conn);
 	/* Free client when connection freed. */
 	tal_steal(c->dc.conn, c);
+
+	if (dbid == 0) {
+		assert(num_dbid_zero_clients < ARRAY_SIZE(dbid_zero_clients));
+		dbid_zero_clients[num_dbid_zero_clients++] = c;
+	} else {
+		struct client *old_client = uintmap_get(&clients, dbid);
+
+		/* Close conn and free any old client of this dbid. */
+		if (old_client)
+			io_close(old_client->dc.conn);
+
+		if (!uintmap_add(&clients, dbid, c))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Failed inserting dbid %"PRIu64, dbid);
+		tal_add_destructor(c, destroy_client);
+	}
+
 	return c;
 }
 
@@ -628,7 +658,14 @@ handle_get_per_commitment_point(struct io_conn *conn, struct client *c)
 
 	if (n >= 2) {
 		old_secret = tal(tmpctx, struct secret);
-		per_commit_secret(&shaseed, old_secret, n - 2);
+		if (!per_commit_secret(&shaseed, old_secret, n - 2)) {
+			status_broken("Cannot derive secret %"PRIu64
+				      " for client %s",
+				      n - 1,
+				      type_to_string(tmpctx,
+						     struct pubkey, &c->id));
+			goto fail;
+		}
 	} else
 		old_secret = NULL;
 
@@ -636,6 +673,48 @@ handle_get_per_commitment_point(struct io_conn *conn, struct client *c)
 			 take(towire_hsm_get_per_commitment_point_reply(NULL,
 									&per_commitment_point,
 									old_secret)));
+	return daemon_conn_read_next(conn, &c->dc);
+
+fail:
+	daemon_conn_send(c->master,
+			 take(towire_hsmstatus_client_bad_request(NULL,
+							  &c->id,
+							  c->dc.msg_in)));
+	return io_close(conn);
+}
+
+static struct io_plan *handle_check_future_secret(struct io_conn *conn,
+						  struct client *c)
+{
+	struct daemon_conn *dc = &c->dc;
+	struct secret channel_seed;
+	struct sha256 shaseed;
+	u64 n;
+	struct secret secret, suggested;
+
+	if (!fromwire_hsm_check_future_secret(dc->msg_in, &n,
+							     &suggested)) {
+		status_broken("bad check_future_secret for client %s",
+			      type_to_string(tmpctx, struct pubkey, &c->id));
+		goto fail;
+	}
+
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	if (!derive_shaseed(&channel_seed, &shaseed)) {
+		status_broken("bad derive_shaseed for client %s",
+			      type_to_string(tmpctx, struct pubkey, &c->id));
+		goto fail;
+	}
+
+	if (!per_commit_secret(&shaseed, &secret, n)) {
+		status_broken("bad commit secret #%"PRIu64" for client %s",
+			      n, type_to_string(tmpctx, struct pubkey, &c->id));
+		goto fail;
+	}
+
+	daemon_conn_send(&c->dc,
+			 take(towire_hsm_check_future_secret_reply(NULL,
+				   secret_eq_consttime(&secret, &suggested))));
 	return daemon_conn_read_next(conn, &c->dc);
 
 fail:
@@ -773,6 +852,7 @@ static bool check_client_capabilities(struct client *client,
 		return (client->capabilities & HSM_CAP_SIGN_ONCHAIN_TX) != 0;
 
 	case WIRE_HSM_GET_PER_COMMITMENT_POINT:
+	case WIRE_HSM_CHECK_FUTURE_SECRET:
 		return (client->capabilities & HSM_CAP_COMMITMENT_POINT) != 0;
 
 	case WIRE_HSM_SIGN_REMOTE_COMMITMENT_TX:
@@ -805,6 +885,7 @@ static bool check_client_capabilities(struct client *client,
 	case WIRE_HSM_SIGN_COMMITMENT_TX_REPLY:
 	case WIRE_HSM_SIGN_TX_REPLY:
 	case WIRE_HSM_GET_PER_COMMITMENT_POINT_REPLY:
+	case WIRE_HSM_CHECK_FUTURE_SECRET_REPLY:
 	case WIRE_HSM_GET_CHANNEL_BASEPOINTS_REPLY:
 		break;
 	}
@@ -885,6 +966,9 @@ static struct io_plan *handle_client(struct io_conn *conn,
 	case WIRE_HSM_GET_PER_COMMITMENT_POINT:
 		return handle_get_per_commitment_point(conn, c);
 
+	case WIRE_HSM_CHECK_FUTURE_SECRET:
+		return handle_check_future_secret(conn, c);
+
 	case WIRE_HSM_SIGN_REMOTE_COMMITMENT_TX:
 		return handle_sign_remote_commitment_tx(conn, c);
 
@@ -907,6 +991,7 @@ static struct io_plan *handle_client(struct io_conn *conn,
 	case WIRE_HSM_SIGN_COMMITMENT_TX_REPLY:
 	case WIRE_HSM_SIGN_TX_REPLY:
 	case WIRE_HSM_GET_PER_COMMITMENT_POINT_REPLY:
+	case WIRE_HSM_CHECK_FUTURE_SECRET_REPLY:
 	case WIRE_HSM_GET_CHANNEL_BASEPOINTS_REPLY:
 		break;
 	}
@@ -1098,7 +1183,7 @@ static void pass_client_hsmfd(struct daemon_conn *master, const u8 *msg)
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR, "creating fds: %s", strerror(errno));
 
-	new_client(master, &id, dbid, capabilities, handle_client, fds[0]);
+	new_client(master, &id, dbid, capabilities, fds[0]);
 	daemon_conn_send(master,
 			 take(towire_hsm_client_hsmfd_reply(NULL)));
 	daemon_conn_send_fd(master, fds[1]);
@@ -1377,30 +1462,36 @@ void dev_disconnect_init(int fd UNUSED)
 
 static void master_gone(struct io_conn *unused UNUSED, struct daemon_conn *dc UNUSED)
 {
+	daemon_shutdown();
 	/* Can't tell master, it's gone. */
 	exit(2);
 }
 
 int main(int argc, char *argv[])
 {
+	struct client *master;
+	struct daemon_conn *status_conn = tal(NULL, struct daemon_conn);
+
 	setup_locale();
 
-	struct client *client;
-
 	subdaemon_setup(argc, argv);
-	status_setup_sync(STDIN_FILENO);
 
-	client = new_client(NULL, NULL, 0, HSM_CAP_MASTER | HSM_CAP_SIGN_GOSSIP, handle_client, REQ_FD);
+	/* A trivial daemon_conn just for writing. */
+	daemon_conn_init(status_conn, status_conn, STDIN_FILENO,
+			 (void *)io_never, NULL);
+	status_setup_async(status_conn);
+	uintmap_init(&clients);
+
+	master = new_client(NULL, NULL, 0, HSM_CAP_MASTER | HSM_CAP_SIGN_GOSSIP,
+			    REQ_FD);
 
 	/* We're our own master! */
-	client->master = &client->dc;
-	io_set_finish(client->dc.conn, master_gone, &client->dc);
+	master->master = &master->dc;
 
 	/* When conn closes, everything is freed. */
-	tal_steal(client->dc.conn, client);
-	io_loop(NULL, NULL);
-	daemon_shutdown();
+	io_set_finish(master->dc.conn, master_gone, &master->dc);
 
-	return 0;
+	io_loop(NULL, NULL);
+	abort();
 }
 #endif

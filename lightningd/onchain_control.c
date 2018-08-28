@@ -1,3 +1,4 @@
+#include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
 #include <common/key_derive.h>
 #include <errno.h>
@@ -75,11 +76,12 @@ static void onchain_tx_depth(struct channel *channel,
 /**
  * Entrypoint for the txwatch callback, calls onchain_tx_depth.
  */
-static enum watch_result onchain_tx_watched(struct channel *channel,
+static enum watch_result onchain_tx_watched(struct lightningd *ld,
+					    struct channel *channel,
 					    const struct bitcoin_txid *txid,
 					    unsigned int depth)
 {
-	u32 blockheight = channel->peer->ld->topology->tip->height;
+	u32 blockheight = get_block_height(ld->topology);
 	if (depth == 0) {
 		log_unusual(channel->log, "Chain reorganization!");
 		channel_set_owner(channel, NULL, false);
@@ -93,7 +95,7 @@ static enum watch_result onchain_tx_watched(struct channel *channel,
 	}
 
 	/* Store the channeltx so we can replay later */
-	wallet_channeltxs_add(channel->peer->ld->wallet, channel,
+	wallet_channeltxs_add(ld->wallet, channel,
 			      WIRE_ONCHAIN_DEPTH, txid, 0, blockheight);
 
 	onchain_tx_depth(channel, txid, depth);
@@ -392,6 +394,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 	struct lightningd *ld = channel->peer->ld;
 	struct pubkey final_key;
 	int hsmfd;
+	u32 feerate;
 
 	channel_fail_permanent(channel, "Funding transaction spent");
 
@@ -436,6 +439,19 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 	/* This could be a mutual close, but it doesn't matter. */
 	bitcoin_txid(channel->last_tx, &our_last_txid);
 
+	/* We try to use normal feerate for onchaind spends. */
+	feerate = try_get_feerate(ld->topology, FEERATE_NORMAL);
+	if (!feerate) {
+		/* We have at least one data point: the last tx's feerate. */
+		u64 fee = channel->funding_satoshi;
+		for (size_t i = 0; i < tal_count(channel->last_tx->output); i++)
+			fee -= channel->last_tx->output[i].amount;
+
+		feerate = fee / measure_tx_weight(tx);
+		if (feerate < feerate_floor())
+			feerate = feerate_floor();
+	}
+
 	msg = towire_onchain_init(channel,
 				  &channel->their_shachain.chain,
 				  channel->funding_satoshi,
@@ -449,7 +465,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				    * we specify theirs. */
 				  channel->channel_info.their_config.to_self_delay,
 				  channel->our_config.to_self_delay,
-				  get_feerate(ld->topology, FEERATE_NORMAL),
+				  feerate,
 				  channel->our_config.dust_limit_satoshis,
 				  &our_last_txid,
 				  p2wpkh_for_keyidx(tmpctx, ld,
@@ -466,7 +482,8 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->last_htlc_sigs,
 				  tal_count(stubs),
 				  channel->min_possible_feerate,
-				  channel->max_possible_feerate);
+				  channel->max_possible_feerate,
+				  channel->future_per_commitment_point);
 	subd_send_msg(channel->owner, take(msg));
 
 	/* FIXME: Don't queue all at once, use an empty cb... */

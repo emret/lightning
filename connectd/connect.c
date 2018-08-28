@@ -133,10 +133,10 @@ struct daemon {
 
 /* Peers we're trying to reach. */
 struct reaching {
-	struct daemon *daemon;
-
 	/* daemon->reaching */
 	struct list_node list;
+
+	struct daemon *daemon;
 
 	/* The ID of the peer (not necessarily unique, in transit!) */
 	struct pubkey id;
@@ -158,11 +158,13 @@ struct reaching {
 	u32 seconds_waited;
 };
 
+/* This is a transitory structure: we hand off to the master daemon as soon
+ * as we've completed INIT read/write. */
 struct peer {
-	struct daemon *daemon;
-
 	/* For reconnecting peers, this is in daemon->reconnecting. */
 	struct list_node list;
+
+	struct daemon *daemon;
 
 	/* The ID of the peer */
 	struct pubkey id;
@@ -382,9 +384,7 @@ static struct io_plan *peer_connected(struct io_conn *conn, struct peer *peer)
 	pubkey_set_add(&daemon->peers,
 		       tal_dup(daemon, struct pubkey, &peer->id));
 
-	/* We keep peer around until master says peer_disconnected */
-	tal_steal(daemon, peer);
-
+	/* This frees the peer. */
 	return io_close_taken_fd(conn);
 }
 

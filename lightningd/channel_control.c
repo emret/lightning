@@ -4,6 +4,7 @@
 #include <common/memleak.h>
 #include <common/timeout.h>
 #include <common/utils.h>
+#include <common/wire_error.h>
 #include <errno.h>
 #include <gossipd/gossip_constants.h>
 #include <hsmd/gen_hsm_client_wire.h>
@@ -17,6 +18,52 @@
 #include <lightningd/subd.h>
 #include <wire/wire_sync.h>
 
+static void update_feerates(struct lightningd *ld, struct channel *channel)
+{
+	u8 *msg;
+	u32 feerate = unilateral_feerate(ld->topology);
+
+	/* Nothing to do if we don't know feerate. */
+	if (!feerate)
+		return;
+
+	msg = towire_channel_feerates(NULL, feerate,
+				      feerate_min(ld, NULL),
+				      feerate_max(ld, NULL));
+	subd_send_msg(channel->owner, take(msg));
+}
+
+static void try_update_feerates(struct lightningd *ld, struct channel *channel)
+{
+	/* No point until funding locked in */
+	if (!channel_fees_can_change(channel))
+		return;
+
+	/* Can't if no daemon listening. */
+	if (!channel->owner)
+		return;
+
+	update_feerates(ld, channel);
+}
+
+void notify_feerate_change(struct lightningd *ld)
+{
+	struct peer *peer;
+
+	/* FIXME: We should notify onchaind about NORMAL fee change in case
+	 * it's going to generate more txs. */
+	list_for_each(&ld->peers, peer, list) {
+		struct channel *channel = peer_active_channel(peer);
+
+		if (!channel)
+			continue;
+
+		/* FIXME: We choose not to drop to chain if we can't contact
+		 * peer.  We *could* do so, however. */
+		try_update_feerates(ld, channel);
+	}
+}
+
 static void lockin_complete(struct channel *channel)
 {
 	/* We set this once we're locked in. */
@@ -24,6 +71,10 @@ static void lockin_complete(struct channel *channel)
 	/* We set this once they're locked in. */
 	assert(channel->remote_funding_locked);
 	channel_set_state(channel, CHANNELD_AWAITING_LOCKIN, CHANNELD_NORMAL);
+
+	/* Fees might have changed (and we use IMMEDIATE once we're funded),
+	 * so update now. */
+	try_update_feerates(channel->peer->ld, channel);
 }
 
 /* We were informed by channeld that it announced the channel and sent
@@ -101,6 +152,24 @@ static void peer_got_shutdown(struct channel *channel, const u8 *msg)
 	wallet_channel_save(ld->wallet, channel);
 }
 
+static void channel_fail_fallen_behind(struct channel *channel, const u8 *msg)
+{
+	struct pubkey per_commitment_point;
+
+	if (!fromwire_channel_fail_fallen_behind(msg, &per_commitment_point)) {
+		channel_internal_error(channel,
+				       "bad channel_fail_fallen_behind %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+
+	channel->future_per_commitment_point
+		= tal_dup(channel, struct pubkey, &per_commitment_point);
+
+	/* Peer sees this, so send a generic msg about unilateral close. */
+	channel_fail_permanent(channel,	"Awaiting unilateral close");
+}
+
 static void peer_start_closingd_after_shutdown(struct channel *channel,
 					       const u8 *msg,
 					       const int *fds)
@@ -147,6 +216,9 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 			return 2;
 		peer_start_closingd_after_shutdown(sd->channel, msg, fds);
 		break;
+	case WIRE_CHANNEL_FAIL_FALLEN_BEHIND:
+		channel_fail_fallen_behind(sd->channel, msg);
+		break;
 
 	/* And we never get these from channeld. */
 	case WIRE_CHANNEL_INIT:
@@ -188,6 +260,7 @@ void peer_start_channeld(struct channel *channel,
 	struct lightningd *ld = channel->peer->ld;
 	const struct config *cfg = &ld->config;
 	bool reached_announce_depth;
+	struct secret last_remote_per_commit_secret;
 
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id,
 				  channel->dbid,
@@ -235,6 +308,27 @@ void peer_start_channeld(struct channel *channel,
 
 	num_revocations = revocations_received(&channel->their_shachain.chain);
 
+	/* BOLT #2:
+	 *
+ 	 *   - if it supports `option_data_loss_protect`:
+	 *     - if `next_remote_revocation_number` equals 0:
+	 *       - MUST set `your_last_per_commitment_secret` to all zeroes
+	 *     - otherwise:
+	 *       - MUST set `your_last_per_commitment_secret` to the last
+	 *         `per_commitment_secret` it received
+	 */
+	if (num_revocations == 0)
+		memset(&last_remote_per_commit_secret, 0,
+		       sizeof(last_remote_per_commit_secret));
+	else if (!shachain_get_secret(&channel->their_shachain.chain,
+				      num_revocations-1,
+				      &last_remote_per_commit_secret)) {
+		channel_fail_permanent(channel,
+				       "Could not get revocation secret %"PRIu64,
+				       num_revocations-1);
+		return;
+	}
+
 	/* Warn once. */
 	if (ld->config.ignore_fee_limits)
 		log_debug(channel->log, "Ignoring fee limits!");
@@ -247,8 +341,8 @@ void peer_start_channeld(struct channel *channel,
 				      &channel->our_config,
 				      &channel->channel_info.their_config,
 				      channel->channel_info.feerate_per_kw,
-				      feerate_min(ld),
-				      feerate_max(ld),
+				      feerate_min(ld, NULL),
+				      feerate_max(ld, NULL),
 				      &channel->last_sig,
 				      cs,
 				      &channel->channel_info.remote_fundingkey,
@@ -284,10 +378,15 @@ void peer_start_channeld(struct channel *channel,
 							channel->final_key_idx),
 				      channel->channel_flags,
 				      funding_signed,
-				      reached_announce_depth);
+				      reached_announce_depth,
+				      &last_remote_per_commit_secret);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));
+
+	/* On restart, feerate might not be what we expect: adjust now. */
+	if (channel->funder == LOCAL)
+		try_update_feerates(ld, channel);
 }
 
 bool channel_tell_funding_locked(struct lightningd *ld,

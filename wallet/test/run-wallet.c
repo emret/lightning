@@ -75,9 +75,6 @@ bool fromwire_connect_peer_connected(const tal_t *ctx UNNEEDED, const void *p UN
 /* Generated stub for fromwire_hsm_sign_commitment_tx_reply */
 bool fromwire_hsm_sign_commitment_tx_reply(const void *p UNNEEDED, secp256k1_ecdsa_signature *sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsm_sign_commitment_tx_reply called!\n"); abort(); }
-/* Generated stub for get_feerate */
-u32 get_feerate(const struct chain_topology *topo UNNEEDED, enum feerate feerate UNNEEDED)
-{ fprintf(stderr, "get_feerate called!\n"); abort(); }
 /* Generated stub for invoices_autoclean_set */
 void invoices_autoclean_set(struct invoices *invoices UNNEEDED,
 			    u64 cycle_seconds UNNEEDED,
@@ -357,13 +354,17 @@ u8 *towire_errorfmt(const tal_t *ctx UNNEEDED,
 /* Generated stub for towire_hsm_sign_commitment_tx */
 u8 *towire_hsm_sign_commitment_tx(const tal_t *ctx UNNEEDED, const struct pubkey *peer_id UNNEEDED, u64 channel_dbid UNNEEDED, const struct bitcoin_tx *tx UNNEEDED, const struct pubkey *remote_funding_key UNNEEDED, u64 funding_amount UNNEEDED)
 { fprintf(stderr, "towire_hsm_sign_commitment_tx called!\n"); abort(); }
+/* Generated stub for try_get_feerate */
+u32 try_get_feerate(const struct chain_topology *topo UNNEEDED, enum feerate feerate UNNEEDED)
+{ fprintf(stderr, "try_get_feerate called!\n"); abort(); }
 /* Generated stub for watch_txid */
 struct txwatch *watch_txid(const tal_t *ctx UNNEEDED,
 			   struct chain_topology *topo UNNEEDED,
 			   struct channel *channel UNNEEDED,
 			   const struct bitcoin_txid *txid UNNEEDED,
-			   enum watch_result (*cb)(struct channel *channel UNNEEDED,
-						    const struct bitcoin_txid * UNNEEDED,
+			   enum watch_result (*cb)(struct lightningd *ld UNNEEDED,
+						   struct channel *channel UNNEEDED,
+						   const struct bitcoin_txid * UNNEEDED,
 						   unsigned int depth))
 { fprintf(stderr, "watch_txid called!\n"); abort(); }
 /* Generated stub for watch_txo */
